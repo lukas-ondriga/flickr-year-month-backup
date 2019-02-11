@@ -26,7 +26,6 @@ function createDirectoryIfDoesNotExist(dir)
     }
 }
 
-
 /**
  * Check whether or not the JPG ends in 0xFFD9.
  */
@@ -98,12 +97,48 @@ Flickr.authenticate(FlickrOptions, function(error, flickr) {
     var util = require('util');
 
     var actualPhotoMetaData = {
-        baseDir: flickr.options.backup_dir
+        baseDir: flickr.options.backup_dir,
+        pageIndex: 1,
+        photoCounter: -1,
+        photoIndex: 0,
+        perPage: 100
     };
+
+    function nextPhoto(result, call)
+    {
+        var photoNumber = ++actualPhotoMetaData.photoCounter;
+        actualPhotoMetaData.pageIndex = Math.floor((photoNumber / actualPhotoMetaData.perPage) + 1);
+        actualPhotoMetaData.photoIndex = photoNumber % actualPhotoMetaData.perPage;
+
+        call();
+    }
+
+    function setActualPage(flickr, result, options)
+    {
+        options.page = actualPhotoMetaData.pageIndex;
+        return options;
+    }
+
+    function isNewPage()
+    {
+        return actualPhotoMetaData.photoIndex == 0;
+    }
+
+    function processOldPage(result, nextCall)
+    {
+        nextCall(undefined, actualPhotoMetaData.oldPage);
+    }
 
     function setActualPhotoId(result)
     {
-        actualPhotoMetaData.id = result.photos.photo[0].id;
+        console.log("Processing photo ", actualPhotoMetaData.photoCounter + 1, "/", result.photos.total);
+        if(actualPhotoMetaData.photoCounter >= result.photos.total)
+        {
+            process.exit();
+        }
+        actualPhotoMetaData.id = result.photos.photo[actualPhotoMetaData.photoIndex].id;
+        actualPhotoMetaData.oldPage = result;
+        actualPhotoMetaData.perPage = result.photos.perpage;
     }
 
     function setPhotoId(flickr, result, options)
@@ -111,6 +146,7 @@ Flickr.authenticate(FlickrOptions, function(error, flickr) {
         options.photo_id = actualPhotoMetaData.id;
         return options;
     }
+
 
     function prepareFilePath(result)
     {
@@ -130,12 +166,6 @@ Flickr.authenticate(FlickrOptions, function(error, flickr) {
     {
         console.log(actualPhotoMetaData);
         console.log(result.sizes.size.slice(-1)[0]);
-    }
-
-    function lastCall(err, result)
-    {
-        console.log("Flickr backup finished.")
-        process.exit();
     }
 
     function getPhoto(result, nextCall)
@@ -173,7 +203,14 @@ Flickr.authenticate(FlickrOptions, function(error, flickr) {
                execute: call
         };
     }
-
+    function flickrCallIf(statement, callTrue, callFalse, ...paramSetters)
+    {
+        return {
+               getParams: pipeParamConstruction(...paramSetters),
+               execute: statement ? callTrue : callFalse
+        };
+        return flickrCall(call, ...paramSetters)
+    }
 
     var composeFlickrCalls = (...functionObjects) => (lastCall) =>  functionObjects.reduceRight((nextCall, functionObject) =>
     {
@@ -185,15 +222,25 @@ Flickr.authenticate(FlickrOptions, function(error, flickr) {
 
     var pipeParamConstruction = (...functions) => (flickr, params) => functions.reduce((options, call) => call(flickr, params, options), {});
 
-    composeFlickrCalls(
-    flickrCall(flickr.photos.search, setBaseOptions),
+    console.log("Starting backup")
+
+    var exec = composeFlickrCalls(
+    resultProcessorCallback(nextPhoto),
+    flickrCallIf(isNewPage, flickr.photos.search, processOldPage,  setBaseOptions, setActualPage),
     resultProcessor(setActualPhotoId),
     flickrCall(flickr.photos.getInfo, setBaseOptions, setPhotoId),
     resultProcessor(prepareFilePath),
     flickrCall(flickr.photos.getSizes, setBaseOptions, setPhotoId),
-    resultProcessor(printActualPhotoMetaData),
     resultProcessorCallback(getPhoto)
-    )(lastCall)(undefined, undefined);
+    );
+
+    function lastCall(err, result)
+    {
+        exec(lastCall)();
+    }
+
+    exec(lastCall)();
+
 
 
 
