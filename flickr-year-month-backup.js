@@ -3,7 +3,13 @@ var habitat = require("habitat"),
     Flickr = require('flickrapi'),
     fs = require('fs'),
     https = require('https'),
+    glob = require('glob'),
     FlickrOptions = env.get("FLICKR");
+
+var photoSavedIds = [];
+glob(FlickrOptions.backup_dir +  '/*/*/*', {}, (err, files)=>{
+  photoSavedIds = files.map((filename) => filename.replace(/^.*[\\\/]/, '').slice(0,-4));
+});
 
 function setBaseOptions(flickr, result, options)
 {
@@ -101,12 +107,22 @@ Flickr.authenticate(FlickrOptions, function(error, flickr) {
         pageIndex: 1,
         photoCounter: -1,
         photoIndex: 0,
-        perPage: 100
+        perPage: 100,
+        failure: false,
+        skip: false
     };
 
     function nextPhoto(result, call)
     {
-        var photoNumber = ++actualPhotoMetaData.photoCounter;
+        if(! actualPhotoMetaData.failure)
+        {
+            ++actualPhotoMetaData.photoCounter;
+        }
+        else
+        {
+            actualPhotoMetaData.failure = false;
+        }
+        var photoNumber = actualPhotoMetaData.photoCounter;
         actualPhotoMetaData.pageIndex = Math.floor((photoNumber / actualPhotoMetaData.perPage) + 1);
         actualPhotoMetaData.photoIndex = photoNumber % actualPhotoMetaData.perPage;
 
@@ -115,29 +131,45 @@ Flickr.authenticate(FlickrOptions, function(error, flickr) {
 
     function setActualPage(flickr, result, options)
     {
+        //console.log("Set actual page: ", actualPhotoMetaData.pageIndex);
         options.page = actualPhotoMetaData.pageIndex;
         return options;
     }
 
     function isNewPage()
     {
-        return actualPhotoMetaData.photoIndex == 0;
+        //console.log("Is new page?",actualPhotoMetaData.photoIndex);
+        return (actualPhotoMetaData.photoIndex == 0);
     }
 
     function processOldPage(result, nextCall)
     {
+        //console.log("process old page");
         nextCall(undefined, actualPhotoMetaData.oldPage);
     }
 
     function setActualPhotoId(result)
     {
-        console.log("Processing photo ", actualPhotoMetaData.photoCounter + 1, "/", result.photos.total);
         if(actualPhotoMetaData.photoCounter >= result.photos.total)
         {
             process.exit();
         }
         actualPhotoMetaData.id = result.photos.photo[actualPhotoMetaData.photoIndex].id;
-        actualPhotoMetaData.oldPage = result;
+        console.log("Processing photo ", actualPhotoMetaData.id,  actualPhotoMetaData.photoCounter + 1, "/", result.photos.total);
+        var cacheIndex = photoSavedIds.indexOf(actualPhotoMetaData.id);
+        if(cacheIndex != -1)
+        {
+            console.log("Photo", actualPhotoMetaData.path, "already exists. Found in cache. index:", cacheIndex);
+            //console.log("Skip was set.");
+            actualPhotoMetaData.skip=true;
+        }
+        if(actualPhotoMetaData.oldPage === undefined || result.photos.page != actualPhotoMetaData.oldPage.photos.page)
+        {
+            //console.log("Set next page:", result.photos.page);
+            //console.log(result.photos.photo[99]);
+            actualPhotoMetaData.oldPage = result;
+            //console.log(actualPhotoMetaData.oldPage.photos.photo[99]);
+        }
         actualPhotoMetaData.perPage = result.photos.perpage;
     }
 
@@ -150,7 +182,9 @@ Flickr.authenticate(FlickrOptions, function(error, flickr) {
 
     function prepareFilePath(result)
     {
-        actualPhotoMetaData.fileName = result.photo.title._content;
+        //console.log(result);
+        actualPhotoMetaData.fileName = result.photo.id;
+        actualPhotoMetaData.fileName += "." + result.photo.originalformat;
         actualPhotoMetaData.taken = result.photo.dates.taken;
         const year = actualPhotoMetaData.taken.substring(0,4);
         const yearMonth = actualPhotoMetaData.taken.substring(0,7);
@@ -170,10 +204,15 @@ Flickr.authenticate(FlickrOptions, function(error, flickr) {
 
     function getPhoto(result, nextCall)
     {
+        if(result === undefined)
+        {
+            nextCall("Result is undefined");
+            return;
+        }
         actualPhotoMetaData.url = result.sizes.size.slice(-1)[0].source;
         if (fs.existsSync(actualPhotoMetaData.path))
         {
-            console.log("Photo", actualPhotoMetaData.path, "already exists.");
+            console.log("Photo", actualPhotoMetaData.path, "already exists. Found in filesystem.");
             nextCall();
         }
         else
@@ -186,14 +225,25 @@ Flickr.authenticate(FlickrOptions, function(error, flickr) {
     {
         return {
                getParams: pipeParamConstruction(setLastResult),
-               execute: (params, nextCall) => { call(params.result); nextCall(undefined, params.result); }
+               execute: (params, nextCall) => 
+               { 
+                    var error = params.result === undefined;
+                    if(! error)
+                    {
+                        call(params.result); 
+                    }
+                    nextCall(error ? "Result is undefined." : false, params.result); 
+               }
         };
     }
     function resultProcessorCallback(call)
-    {
+   { 
         return {
                getParams: pipeParamConstruction(setLastResult),
-               execute: (params, nextCall) => { call(params.result, nextCall); }
+               execute: (params, nextCall) => 
+               { 
+                  call(params.result, nextCall); 
+               }
         };
     }
     function flickrCall(call, ...paramSetters)
@@ -207,15 +257,38 @@ Flickr.authenticate(FlickrOptions, function(error, flickr) {
     {
         return {
                getParams: pipeParamConstruction(...paramSetters),
-               execute: statement ? callTrue : callFalse
+               execute: (params, nextCall) => {
+                if(statement())
+                { 
+                    //console.log("Call true");
+                    console.log(params);
+                    //var wrappedNextCall = (err, result) => { console.log(result); nextCall(err, result); };
+                    callTrue(params, nextCall);
+                }
+                else
+                {
+                    callFalse(params, nextCall);
+                }
+              }
         };
-        return flickrCall(call, ...paramSetters)
     }
 
     var composeFlickrCalls = (...functionObjects) => (lastCall) =>  functionObjects.reduceRight((nextCall, functionObject) =>
     {
         return function(err, result)
         {
+               if(err !== undefined && err != false)
+               {
+                    console.log("Error: ", err);
+                    actualPhotoMetaData.failure = true;
+                    return lastCall();
+               }
+               if(actualPhotoMetaData.skip)
+               {
+                    //console.log("Skip was reset.");
+                    actualPhotoMetaData.skip = false;
+                    return lastCall();
+               }
                functionObject.execute(functionObject.getParams(flickr, result), nextCall);
         };
     }, lastCall);
@@ -235,13 +308,10 @@ Flickr.authenticate(FlickrOptions, function(error, flickr) {
     );
 
     function lastCall(err, result)
-    {
+    {   
         exec(lastCall)();
     }
 
     exec(lastCall)();
-
-
-
 
 });
